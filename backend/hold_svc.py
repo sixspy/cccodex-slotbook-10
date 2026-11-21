@@ -68,16 +68,29 @@ def create_hold(body: HoldIn, authorization: AuthHeader = None):
                 conn.commit()
                 return {"disposition": "候补", "free": free}
             cur = conn.execute(
-                """INSERT INTO holds(slot_id,party_key,seats,status,expire_at,created_at)
-                   VALUES (?,?,?,?,?,?)""",
-                (slot["id"], body.party_key, body.seats, "占位中", expire, now),
+                """INSERT INTO holds(slot_id,party_key,seats,status,expire_at,created_at,gen)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (
+                    slot["id"],
+                    body.party_key,
+                    body.seats,
+                    "占位中",
+                    expire,
+                    now,
+                    slot["generation"],
+                ),
             )
             write_audit(
                 conn,
                 user,
                 "hold_create",
                 body.party_key,
-                {"slot": body.slot_code, "seats": body.seats, "hold_id": cur.lastrowid},
+                {
+                    "slot": body.slot_code,
+                    "seats": body.seats,
+                    "hold_id": cur.lastrowid,
+                    "gen": slot["generation"],
+                },
             )
             conn.commit()
             return {"disposition": "占位", "hold_id": cur.lastrowid, "expire_at": expire}

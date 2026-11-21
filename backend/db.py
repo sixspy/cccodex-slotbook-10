@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS holds(
   status TEXT NOT NULL,
   expire_at TEXT NOT NULL,
   created_at TEXT NOT NULL,
+  gen INTEGER NOT NULL DEFAULT 1,
   FOREIGN KEY(slot_id) REFERENCES slots(id)
 );
 CREATE TABLE IF NOT EXISTS bookings(
@@ -123,7 +124,17 @@ CREATE TABLE IF NOT EXISTS transfer_jobs(
   note TEXT,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS capacity_gen_registry(
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  path TEXT NOT NULL,
+  decided_by TEXT NOT NULL,
+  decided_at TEXT NOT NULL
+);
 """
+
+# 改容抬代册：2026-11-21 择定甲路径，当天禁止改口。
+# 甲路径 = 同一事务改容量并令代数加一，失败则容量与代数同滚。
+CAPACITY_GEN_PATH = "甲同事务"
 
 
 def write_audit(conn, actor: str, action: str, target: str, payload: dict | None = None) -> None:
@@ -177,12 +188,14 @@ def seed_if_empty(conn) -> None:
             ),
         )
     for h in holds:
-        slot = conn.execute("SELECT id FROM slots WHERE code=?", (h["slot_code"],)).fetchone()
+        slot = conn.execute(
+            "SELECT id, generation FROM slots WHERE code=?", (h["slot_code"],)
+        ).fetchone()
         if not slot:
             continue
         conn.execute(
-            """INSERT INTO holds(slot_id,party_key,seats,status,expire_at,created_at)
-               VALUES (?,?,?,?,?,?)""",
+            """INSERT INTO holds(slot_id,party_key,seats,status,expire_at,created_at,gen)
+               VALUES (?,?,?,?,?,?,?)""",
             (
                 slot["id"],
                 h["party_key"],
@@ -190,6 +203,7 @@ def seed_if_empty(conn) -> None:
                 h["status"],
                 h["expire_at"],
                 h["created_at"],
+                slot["generation"],
             ),
         )
     # 一笔已确认正式册，便于对账种子
@@ -210,9 +224,29 @@ def seed_if_empty(conn) -> None:
     write_audit(conn, "system", "seed", "slots", {"count": len(slots)})
 
 
+def _migrate(conn) -> None:
+    """既有库轻量护栏：占位表补挂代列（不迁部署、登录与库路径不变）。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(holds)")}
+    if "gen" not in cols:
+        conn.execute("ALTER TABLE holds ADD COLUMN gen INTEGER NOT NULL DEFAULT 1")
+
+
+def _seed_capacity_gen_registry(conn) -> None:
+    """择定后写入改容抬代册；INSERT OR IGNORE 保证册口不再改。"""
+    from datetime import datetime
+
+    conn.execute(
+        """INSERT OR IGNORE INTO capacity_gen_registry(id,path,decided_by,decided_at)
+           VALUES (1,?,?,?)""",
+        (CAPACITY_GEN_PATH, "system", datetime.now().isoformat(timespec="seconds")),
+    )
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         ensure_users(conn)
         seed_if_empty(conn)
+        _seed_capacity_gen_registry(conn)
         conn.commit()

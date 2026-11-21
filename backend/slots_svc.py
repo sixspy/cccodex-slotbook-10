@@ -1,4 +1,4 @@
-"""档期盘：开档、关档、容量查询。"""
+"""档期盘：开档、关档、改容抬代、容量查询。"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, write_audit
-from locks import release, require_lock
+from locks import release, require_lock, try_acquire
 
 router = APIRouter(tags=["slots"])
 
@@ -23,6 +23,13 @@ class SlotIn(BaseModel):
 
 class CloseIn(BaseModel):
     code: str
+
+
+class CapacityIn(BaseModel):
+    code: str
+    capacity: int = Field(ge=1, le=500)
+    bump_generation: bool = True
+    path: str | None = None  # 缺省 = 遵册；显式给且与册不符 = 偏离
 
 
 @router.get("/api/slots")
@@ -99,6 +106,90 @@ def close_slot(body: CloseIn, authorization: AuthHeader = None):
             release(conn, f"slot:{body.code}", user)
             conn.commit()
     return {"ok": True}
+
+
+@router.post("/api/slots/capacity")
+def change_capacity(body: CapacityIn, authorization: AuthHeader = None):
+    """改容写口：改容必须连带抬代。
+
+    甲路径（改容抬代册 2026-11-21 择定，当天禁止改口）：
+    同一事务改容量并令代数加一，失败则容量与代数同滚。
+    禁止只改容量数不抬代；偏离册拒写并记偏；双人改同档须占档锁，后到只记争用。
+    """
+    user = require_writer(authorization)
+    lock_key = f"slot:{body.code}"
+    with connect() as conn:
+        reg = conn.execute(
+            "SELECT * FROM capacity_gen_registry WHERE id=1"
+        ).fetchone()
+        if reg is None:
+            raise HTTPException(500, "改容抬代册未立，拒写")
+        if body.path is not None and body.path != reg["path"]:
+            write_audit(
+                conn,
+                user,
+                "capacity_gen_deviation",
+                body.code,
+                {
+                    "detail": f"册定{reg['path']}，来单{body.path}，当天禁止改口",
+                    "capacity": body.capacity,
+                },
+            )
+            conn.commit()  # 记偏落库
+            raise HTTPException(409, "偏离改容抬代册，拒写并记偏")
+        if not body.bump_generation:
+            write_audit(
+                conn,
+                user,
+                "capacity_gen_deviation",
+                body.code,
+                {"detail": "只改容量数不抬代", "capacity": body.capacity},
+            )
+            conn.commit()  # 记偏落库
+            raise HTTPException(409, "禁止只改容量数不抬代，拒写并记偏")
+        if not try_acquire(conn, lock_key, user):
+            conn.commit()  # 争用落库：后到只记争用，不写业务
+            raise HTTPException(409, "争用：后到只记争用，不写业务")
+        try:
+            row = conn.execute(
+                "SELECT * FROM slots WHERE code=?", (body.code,)
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "档期不存在")
+            if body.capacity < int(row["booked"]):
+                raise HTTPException(409, "新容量低于已订，拒写")
+            # 甲路径：同一事务改容量并令代数加一
+            conn.execute(
+                "UPDATE slots SET capacity=?, generation=generation+1 WHERE id=?",
+                (body.capacity, row["id"]),
+            )
+            write_audit(
+                conn,
+                user,
+                "capacity_change",
+                body.code,
+                {
+                    "old_capacity": row["capacity"],
+                    "new_capacity": body.capacity,
+                    "old_gen": row["generation"],
+                    "new_gen": int(row["generation"]) + 1,
+                    "path": reg["path"],
+                },
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()  # 失败则容量与代数同滚
+            raise
+        finally:
+            release(conn, lock_key, user)
+            conn.commit()
+        return {
+            "ok": True,
+            "code": body.code,
+            "capacity": body.capacity,
+            "generation": int(row["generation"]) + 1,
+            "path": reg["path"],
+        }
 
 
 @router.get("/api/dashboard")
